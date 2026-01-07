@@ -97,19 +97,53 @@ grpc_call_error ValidateClientBatch(const grpc_op* ops, size_t nops) {
   return GRPC_CALL_OK;
 }
 
+/*
+The failure of ProxyEnd2endTest.EchoDeadline with
+promise_based_http2_client_transport was caused by the Call V3 stack not
+implicitly propagating the deadline from a parent call when ClientContext had an
+infinite deadline (the default).
+
+ClientContext::FromServerContext sets up the parent call but leaves the
+deadline_ field as InfFuture. In the legacy C-core stack, grpc_call_create
+implicitly checks the parent call's deadline. However, ClientCall (the V3
+implementation) was not checking the parent call's deadline in its constructor,
+causing it to use the infinite deadline passed from ClientContext.
+
+The fix involved modifying ClientCall::ClientCall in
+src/core/call/client_call.cc to explicitly check if deadline is InfFuture and
+parent_call is provided. If so, it retrieves the deadline from the parent call
+using Call::FromC(parent_call)->deadline(). This restores the expected implicit
+deadline propagation behavior in the Call V3 stack, fixing the test without
+needing modifications to the test code itself.
+
+*/
+
+Timestamp GetEffectiveDeadline(const Timestamp deadline,
+                               grpc_call* const parent,
+                               const uint32_t propagation_mask) {
+  if (parent != nullptr && (propagation_mask & GRPC_PROPAGATE_DEADLINE) != 0u) {
+    return std::min(deadline, Call::FromC(parent)->deadline());
+  }
+  return deadline;
+}
+
 }  // namespace
 
-ClientCall::ClientCall(grpc_call*, uint32_t, grpc_completion_queue* cq,
-                       Slice path, std::optional<Slice> authority,
-                       bool registered_method, Timestamp deadline,
+ClientCall::ClientCall(grpc_call* parent_call, const uint32_t propagation_mask,
+                       grpc_completion_queue* cq, Slice path,
+                       std::optional<Slice> authority, bool registered_method,
+                       Timestamp deadline,
                        grpc_compression_options compression_options,
                        RefCountedPtr<Arena> arena,
                        RefCountedPtr<UnstartedCallDestination> destination)
-    : Call(/*is_client=*/true, deadline, std::move(arena)),
+    : Call(/*is_client=*/true,
+           GetEffectiveDeadline(deadline, parent_call, propagation_mask),
+           std::move(arena)),
       DualRefCounted("ClientCall"),
       cq_(cq),
       call_destination_(std::move(destination)),
       compression_options_(compression_options) {
+  deadline = GetEffectiveDeadline(deadline, parent_call, propagation_mask);
   global_stats().IncrementClientCallsCreated();
   send_initial_metadata_->Set(HttpPathMetadata(), std::move(path));
   if (authority.has_value()) {
